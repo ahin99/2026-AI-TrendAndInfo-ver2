@@ -5,7 +5,9 @@ import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
@@ -18,11 +20,9 @@ OUTPUT_DIR = Path(
     )
 )
 
-# Notion DB의 세션 속성 이름
-SESSION_PROPERTY = os.environ.get(
-    "NOTION_SESSION_PROPERTY",
-    "세션"
-)
+# Notion DB의 생성일 속성 이름과 주차 계산 시간대
+CREATED_DATE_PROPERTY = os.environ.get("NOTION_CREATED_DATE_PROPERTY", "생성일")
+SYNC_TIMEZONE = ZoneInfo(os.environ.get("NOTION_TIMEZONE", "Asia/Seoul"))
 
 API_BASE = "https://api.notion.com/v1"
 
@@ -143,74 +143,56 @@ def get_page_title(page):
     return "untitled"
 
 
-def get_session_name(page):
-    """
-    Notion DB의 '세션' Select 속성에서
-    선택된 세션 이름을 가져옵니다.
+def get_created_date(page):
+    """생성일 속성을 우선 사용하고, 비어 있으면 페이지 생성 시각을 사용합니다."""
+    prop = page.get("properties", {}).get(CREATED_DATE_PROPERTY)
+    value = None
+    source_timezone = SYNC_TIMEZONE
 
-    예:
-        세션01
-        세션02
-        세션03
+    if prop:
+        prop_type = prop.get("type")
+        if prop_type == "date":
+            date_value = prop.get("date") or {}
+            value = date_value.get("start")
+            if date_value.get("time_zone"):
+                source_timezone = ZoneInfo(date_value["time_zone"])
+        elif prop_type == "created_time":
+            value = prop.get("created_time")
+        else:
+            raise ValueError(
+                f"Page {page['id']}: '{CREATED_DATE_PROPERTY}' must be "
+                f"a date or created_time property, got {prop_type!r}."
+            )
 
-    세션이 지정되지 않았으면 '미분류' 폴더에 저장합니다.
-    """
-
-    properties = page.get(
-        "properties",
-        {}
-    )
-
-    session_prop = properties.get(
-        SESSION_PROPERTY
-    )
-
-    if not session_prop:
+    if not value:
+        value = page.get("created_time")
+        source_timezone = SYNC_TIMEZONE
         print(
-            f"WARNING: "
-            f"'{SESSION_PROPERTY}' "
-            f"property not found."
+            f"WARNING: page {page['id']} has no '{CREATED_DATE_PROPERTY}' "
+            "value; using page created_time."
         )
 
-        return "미분류"
+    if not value:
+        raise ValueError(f"Page {page['id']}: creation date is missing.")
 
-    prop_type = session_prop.get(
-        "type"
-    )
+    try:
+        # 날짜만 입력된 값은 시간대 변환 없이 그대로 사용합니다.
+        if len(value) == 10:
+            return date.fromisoformat(value)
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=source_timezone)
+        return timestamp.astimezone(SYNC_TIMEZONE).date()
+    except ValueError as exc:
+        raise ValueError(
+            f"Page {page['id']}: invalid creation date {value!r}."
+        ) from exc
 
-    # Select 속성
-    if prop_type == "select":
 
-        select_value = session_prop.get(
-            "select"
-        )
-
-        if select_value:
-            name = select_value.get(
-                "name",
-                ""
-            ).strip()
-
-            if name:
-                return name
-
-    # 혹시 Status 속성으로 변경할 경우에도 대응
-    if prop_type == "status":
-
-        status_value = session_prop.get(
-            "status"
-        )
-
-        if status_value:
-            name = status_value.get(
-                "name",
-                ""
-            ).strip()
-
-            if name:
-                return name
-
-    return "미분류"
+def get_week_bounds(created_date):
+    """생성일이 속한 주의 월요일과 일요일을 반환합니다."""
+    monday = created_date - timedelta(days=created_date.weekday())
+    return monday, monday + timedelta(days=6)
 
 
 def safe_name(value):
@@ -261,16 +243,17 @@ def yaml_escape(value):
     return f'"{value}"'
 
 
-def save_page(page):
+def save_page(page, created_date=None):
     page_id = page["id"]
 
     title = get_page_title(
         page
     )
 
-    session_name = get_session_name(
-        page
-    )
+    if created_date is None:
+        created_date = get_created_date(page)
+    week_start, week_end = get_week_bounds(created_date)
+    week_name = f"{week_start.isoformat()}_{week_end.isoformat()}"
 
     markdown = retrieve_markdown(
         page_id
@@ -281,22 +264,16 @@ def save_page(page):
         f"--{page_id.replace('-', '')[:8]}.md"
     )
 
-    # ---------------------------------
-    # 세션별 폴더 생성
-    # ---------------------------------
+    # 월요일부터 일요일까지 같은 주의 글을 한 폴더에 저장합니다.
+    week_dir = OUTPUT_DIR / week_name
 
-    session_dir = (
-        OUTPUT_DIR
-        / safe_name(session_name)
-    )
-
-    session_dir.mkdir(
+    week_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     file_path = (
-        session_dir
+        week_dir
         / filename
     )
 
@@ -304,7 +281,9 @@ def save_page(page):
         [
             "---",
             f"title: {yaml_escape(title)}",
-            f"session: {yaml_escape(session_name)}",
+            f"created_date: {yaml_escape(created_date.isoformat())}",
+            f"week_start: {yaml_escape(week_start.isoformat())}",
+            f"week_end: {yaml_escape(week_end.isoformat())}",
             f"notion_page_id: {yaml_escape(page_id)}",
             f"last_edited_time: "
             f"{yaml_escape(page.get('last_edited_time', ''))}",
@@ -332,7 +311,7 @@ def save_page(page):
 
     print(
         f"Saved: "
-        f"[{session_name}] "
+        f"[{week_name}] "
         f"{file_path}"
     )
 
@@ -348,25 +327,10 @@ def main():
         f"Found {len(pages)} pages."
     )
 
-    # notion-posts 폴더는
-    # Notion DB의 현재 상태를 그대로 반영합니다.
-    #
-    # 따라서:
-    #
-    # - 삭제된 글
-    # - 세션이 변경된 글
-    # - 기존 세션 폴더
-    #
-    # 모두 한번 지운 뒤 현재 Notion 상태를 기준으로
-    # 다시 생성합니다.
-    #
-    # 예:
-    #
-    # 세션02 → 세션03
-    #
-    # 으로 변경하면 예전 세션02 파일은 사라지고
-    # 세션03 폴더에 새로 생성됩니다.
+    # 날짜 오류가 있으면 기존 내보내기 파일을 지우기 전에 중단합니다.
+    dated_pages = [(page, get_created_date(page)) for page in pages]
 
+    # 전체를 다시 생성하여 기존 분류 폴더와 날짜가 변경된 글도 정리합니다.
     if OUTPUT_DIR.exists():
         shutil.rmtree(
             OUTPUT_DIR
@@ -377,8 +341,8 @@ def main():
         exist_ok=True,
     )
 
-    for page in pages:
-        save_page(page)
+    for page, created_date in dated_pages:
+        save_page(page, created_date)
 
     print()
     print(
