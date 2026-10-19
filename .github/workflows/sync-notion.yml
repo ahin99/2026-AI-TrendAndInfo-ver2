@@ -11,40 +11,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # -------------------------------------------------------
-      # 1. GitHub 저장소 체크아웃
-      # -------------------------------------------------------
+      # 1. Repository checkout
       - name: Checkout repository
         uses: actions/checkout@v6
 
-
-      # -------------------------------------------------------
-      # 2. Python 설치
-      # -------------------------------------------------------
+      # 2. Python setup
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-
-      # -------------------------------------------------------
-      # 3. Gemini Python SDK 설치
-      #
-      # generate_weekly_digest.py에서
-      # from google import genai
-      # 를 사용하기 위해 필요
-      # -------------------------------------------------------
+      # 3. Gemini SDK install
       - name: Install Gemini SDK
         run: |
           python -m pip install --upgrade pip
           python -m pip install google-genai
 
-
-      # -------------------------------------------------------
-      # 4. Notion → Markdown 동기화
-      #
-      # 기존 동작 그대로 유지
-      # -------------------------------------------------------
+      # 4. Notion -> Markdown
       - name: Sync Notion pages
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -55,31 +38,56 @@ jobs:
         run: |
           python scripts/sync_notion.py
 
+      # 5. 실제 생성된 폴더 구조 확인
+      - name: Show Notion folder structure
+        run: |
+          echo "===== notion-posts directories ====="
+          find notion-posts -maxdepth 3 -type d | sort
 
-      # -------------------------------------------------------
-      # 5. 최신 주차 통합 읽을거리 생성
-      #
-      # scripts/generate_weekly_digest.py가
-      # notion-posts의 가장 최신 주차 폴더만 확인
-      #
-      # 과거 주차 글이 수정/추가되어도
-      # 과거 통합 읽을거리는 수정하지 않음
-      # -------------------------------------------------------
+          echo ""
+          echo "===== markdown files ====="
+          find notion-posts -maxdepth 3 -type f -name "*.md" | sort
+
+      # 6. Gemini API Key 존재 여부 확인
+      # 실제 키 값은 출력하지 않음
+      - name: Check Gemini API key
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "ERROR: GEMINI_API_KEY secret is not set."
+            exit 1
+          fi
+
+          echo "GEMINI_API_KEY is configured."
+
+      # 7. Gemini 통합 읽을거리 생성
       - name: Generate weekly AI digest
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python scripts/generate_weekly_digest.py
 
+      # 8. 통합 읽을거리가 실제 생성됐는지 확인
+      - name: Verify weekly digest
+        run: |
+          echo "===== weekly-digests ====="
 
-      # -------------------------------------------------------
-      # 6. 변경된 파일이 있는지 확인
-      #
-      # notion-posts
-      # weekly-digests
-      #
-      # 둘 중 하나라도 변경됐으면 changed=true
-      # -------------------------------------------------------
+          if [ ! -d "weekly-digests" ]; then
+            echo "ERROR: weekly-digests directory was not created."
+            exit 1
+          fi
+
+          find weekly-digests -maxdepth 1 -type f -name "*.md" -print
+
+          if ! find weekly-digests -maxdepth 1 -type f -name "*.md" | grep -q .; then
+            echo "ERROR: No weekly digest Markdown file was generated."
+            exit 1
+          fi
+
+          echo "Weekly digest exists."
+
+      # 9. 변경 여부 확인
       - name: Check for changes
         id: changes
         run: |
@@ -89,20 +97,15 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-
-      # -------------------------------------------------------
-      # 7. 변경 내용 Commit & Push
-      # -------------------------------------------------------
+      # 10. Commit & Push
       - name: Commit and push
         if: steps.changes.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Notion Markdown 변경사항 추가
           git add -A -- notion-posts
 
-          # weekly-digests 폴더가 존재할 때만 추가
           if [ -d "weekly-digests" ]; then
             git add -A -- weekly-digests
           fi
