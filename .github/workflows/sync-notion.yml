@@ -11,14 +11,40 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # -------------------------------------------------------
+      # 1. GitHub 저장소 체크아웃
+      # -------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v6
 
+
+      # -------------------------------------------------------
+      # 2. Python 설치
+      # -------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+
+      # -------------------------------------------------------
+      # 3. Gemini Python SDK 설치
+      #
+      # generate_weekly_digest.py에서
+      # from google import genai
+      # 를 사용하기 위해 필요
+      # -------------------------------------------------------
+      - name: Install Gemini SDK
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install google-genai
+
+
+      # -------------------------------------------------------
+      # 4. Notion → Markdown 동기화
+      #
+      # 기존 동작 그대로 유지
+      # -------------------------------------------------------
       - name: Sync Notion pages
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -29,6 +55,31 @@ jobs:
         run: |
           python scripts/sync_notion.py
 
+
+      # -------------------------------------------------------
+      # 5. 최신 주차 통합 읽을거리 생성
+      #
+      # scripts/generate_weekly_digest.py가
+      # notion-posts의 가장 최신 주차 폴더만 확인
+      #
+      # 과거 주차 글이 수정/추가되어도
+      # 과거 통합 읽을거리는 수정하지 않음
+      # -------------------------------------------------------
+      - name: Generate weekly AI digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python scripts/generate_weekly_digest.py
+
+
+      # -------------------------------------------------------
+      # 6. 변경된 파일이 있는지 확인
+      #
+      # notion-posts
+      # weekly-digests
+      #
+      # 둘 중 하나라도 변경됐으면 changed=true
+      # -------------------------------------------------------
       - name: Check for changes
         id: changes
         run: |
@@ -38,14 +89,24 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+
+      # -------------------------------------------------------
+      # 7. 변경 내용 Commit & Push
+      # -------------------------------------------------------
       - name: Commit and push
         if: steps.changes.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Notion Markdown 변경사항 추가
           git add -A -- notion-posts
 
-          git commit -m "Sync Notion pages by creation week"
+          # weekly-digests 폴더가 존재할 때만 추가
+          if [ -d "weekly-digests" ]; then
+            git add -A -- weekly-digests
+          fi
+
+          git commit -m "Sync Notion pages and weekly AI digest"
 
           git push
