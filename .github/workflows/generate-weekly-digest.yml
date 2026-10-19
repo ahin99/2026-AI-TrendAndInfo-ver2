@@ -1,0 +1,123 @@
+name: Generate Weekly Digest
+
+on:
+  workflow_dispatch:
+    inputs:
+      week_folder:
+        description: "생성할 주차 폴더명 (예: 2026-10-12_2026-10-18)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  generate-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------------
+      # 1. Repository checkout
+      # -------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # -------------------------------------------------------
+      # 2. Python 설치
+      # -------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # -------------------------------------------------------
+      # 3. Gemini SDK 설치
+      # -------------------------------------------------------
+      - name: Install Gemini SDK
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install google-genai
+
+      # -------------------------------------------------------
+      # 4. 선택한 주차 폴더가 실제 존재하는지 확인
+      # -------------------------------------------------------
+      - name: Check selected week
+        env:
+          WEEK_FOLDER: ${{ inputs.week_folder }}
+        run: |
+          echo "선택한 주차: $WEEK_FOLDER"
+
+          if [ ! -d "notion-posts/$WEEK_FOLDER" ]; then
+            echo ""
+            echo "ERROR: 해당 주차 폴더가 없습니다."
+            echo ""
+            echo "현재 선택 가능한 주차 폴더:"
+            find notion-posts -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort
+            exit 1
+          fi
+
+          echo ""
+          echo "해당 주차의 Markdown 파일:"
+          find "notion-posts/$WEEK_FOLDER" -type f -name "*.md" -print
+
+      # -------------------------------------------------------
+      # 5. Gemini 통합 읽을거리 생성
+      #
+      # 기존 파일이 있더라도 새 결과로 덮어쓴다.
+      # -------------------------------------------------------
+      - name: Generate weekly AI digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WEEK_FOLDER: ${{ inputs.week_folder }}
+        run: |
+          python scripts/generate_weekly_digest.py
+
+      # -------------------------------------------------------
+      # 6. 결과 확인
+      # -------------------------------------------------------
+      - name: Verify generated digest
+        env:
+          WEEK_FOLDER: ${{ inputs.week_folder }}
+        run: |
+          OUTPUT_FILE="weekly-digests/$WEEK_FOLDER.md"
+
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            echo "ERROR: 통합 읽을거리가 생성되지 않았습니다."
+            echo "예상 파일: $OUTPUT_FILE"
+            exit 1
+          fi
+
+          echo "통합 읽을거리 생성 확인:"
+          echo "$OUTPUT_FILE"
+
+      # -------------------------------------------------------
+      # 7. 변경사항 확인
+      # -------------------------------------------------------
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet && [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -------------------------------------------------------
+      # 8. Commit & Push
+      #
+      # 같은 주차 파일이 이미 있으면
+      # 수정된 파일로 commit 된다.
+      # -------------------------------------------------------
+      - name: Commit and push
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          WEEK_FOLDER: ${{ inputs.week_folder }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A -- weekly-digests
+
+          git commit -m "Generate weekly digest: $WEEK_FOLDER"
+
+          git push
