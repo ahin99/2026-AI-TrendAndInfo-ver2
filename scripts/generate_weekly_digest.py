@@ -1,8 +1,11 @@
 import os
 import re
+import time
+import random
 from pathlib import Path
 
 from google import genai
+from google.genai import errors
 
 
 # ============================================================
@@ -13,6 +16,8 @@ POSTS_DIR = Path("notion-posts")
 OUTPUT_DIR = Path("weekly-digests")
 
 MODEL_NAME = "gemini-3.8-flash"
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+MAX_ATTEMPTS_PER_MODEL = 2  # SDK 자체 재시도 외 추가 시도 횟수
 
 
 # ============================================================
@@ -362,33 +367,53 @@ def generate_digest(
     week_name: str,
     articles,
 ):
-
-    prompt = build_prompt(
-        week_name,
-        articles,
-    )
+    prompt = build_prompt(week_name, articles)
 
     print()
     print("Gemini API 호출 시작")
-    print(f"모델: {MODEL_NAME}")
+    print(f"기본 모델: {MODEL_NAME}")
     print(f"입력 글 수: {len(articles)}")
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-    )
+    models = [MODEL_NAME, *FALLBACK_MODELS]
+    last_error = None
 
-    if not response.text:
+    for model in models:
+        for attempt in range(1, MAX_ATTEMPTS_PER_MODEL + 1):
+            print(f"[Gemini] 모델={model}, 시도={attempt}/{MAX_ATTEMPTS_PER_MODEL}", flush=True)
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                if not response.text:
+                    raise RuntimeError(
+                        f"Gemini가 빈 응답을 반환했습니다. 모델: {model}"
+                    )
 
-        raise RuntimeError(
-            "Gemini가 빈 응답을 반환했습니다."
-        )
+                print(f"Gemini 응답 수신 완료 (실제 사용 모델: {model})")
+                return response.text.strip(), model
 
-    print(
-        "Gemini 응답 수신 완료"
-    )
+            except errors.APIError as exc:
+                last_error = exc
+                status = getattr(exc, "code", None)
+                print(f"[Gemini 오류] 모델={model}, HTTP={status}: {exc}", flush=True)
 
-    return response.text.strip()
+                # 일시적인 오류에 대해서만 재시도/대체 모델을 적용한다.
+                # 인증/잘못된 요청 등은 재시도로 해결되지 않으므로 즉시 알린다.
+                if status not in (408, 429, 500, 502, 503, 504):
+                    raise
+
+                if attempt < MAX_ATTEMPTS_PER_MODEL:
+                    delay = 5 * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                    print(f"[RETRY] {delay:.1f}초 후 재시도", flush=True)
+                    time.sleep(delay)
+
+        print(f"[FALLBACK] {model} 사용 실패, 다음 모델 확인", flush=True)
+
+    raise RuntimeError(
+        "모든 Gemini 모델이 일시적인 API 오류로 실패했습니다. "
+        "잠시 후 워크플로를 다시 실행하세요."
+    ) from last_error
 
 
 # ============================================================
@@ -398,6 +423,7 @@ def generate_digest(
 def save_digest(
     week_name: str,
     content: str,
+    used_model: str,
 ):
     """
     weekly-digests/주차.md 로 저장한다.
@@ -430,7 +456,7 @@ def save_digest(
     header = f"""---
 source_week: "{week_name}"
 generated_by: "Gemini"
-model: "{MODEL_NAME}"
+model: "{used_model}"
 ---
 
 """
@@ -560,7 +586,7 @@ def main():
     # Gemini API를 다시 호출한다.
     # --------------------------------------------------------
 
-    digest = generate_digest(
+    digest, used_model = generate_digest(
         client,
         week_name,
         articles,
@@ -575,6 +601,7 @@ def main():
     save_digest(
         week_name,
         digest,
+        used_model,
     )
 
     print()
